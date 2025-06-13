@@ -1,56 +1,190 @@
 import streamlit as st
-from openai import OpenAI
+import json
+import time
+import uuid
+from datetime import datetime
 
-# Show title and description.
-st.title("💬 Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
-)
+# --- Backend Mock ---
+# In a real-world scenario, this part would be replaced by actual calls
+# to your backend service (e.g., via HTTP, gRPC, or a message queue).
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+def backend_one_time_query(payload: dict) -> dict:
+    """Mocks a request/response call to the backend."""
+    endpoint = payload.get("endpoint", "unknown")
+    params = payload.get("params", {})
+    st.info(f"📞 Backend received ONE_TIME_QUERY for endpoint: {endpoint} with params: {params}")
+    time.sleep(1.5) # Simulate network and processing delay
+    return {
+        "status": "ok",
+        "data": {
+            "endpoint": endpoint,
+            "user_id": params.get("id", "N/A"),
+            "retrieved_at": datetime.now().isoformat(),
+            "query_result": f"This is the result for query {endpoint}."
+        }
+    }
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+def backend_stream_subscribe(payload: dict):
+    """Mocks a streaming data subscription from the backend."""
+    topic = payload.get("topic", "default_topic")
+    st.info(f"🌊 Backend received STREAM_SUBSCRIBE for topic: {topic}")
+    
+    # Simulate a stream of 10 data chunks
+    for i in range(10):
+        yield {
+            "stream_chunk": {
+                "topic": topic,
+                "sequence": i,
+                "value": f"Live data point #{i} for {topic}",
+                "timestamp": datetime.now().isoformat()
+            }
+        }
+        time.sleep(0.5) # Simulate data arriving every 500ms
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+def backend_execute_command(payload: dict):
+    """Mocks executing a long-running command on the backend."""
+    command = payload.get("command", "unknown_command")
+    st.info(f"⚙️ Backend received EXECUTE_COMMAND: {command}")
+    
+    # Simulate a multi-step process
+    steps = ["initializing", "processing", "validating", "finalizing"]
+    for i, step in enumerate(steps):
+        yield {
+            "progress_update": {
+                "command": command,
+                "step": step,
+                "progress": (i + 1) / len(steps) * 100
+            }
+        }
+        time.sleep(1.0) # Simulate 1 second per step
+    
+    # Yield final result
+    yield {
+        "command_result": {
+            "command": command,
+            "status": "success",
+            "message": "Command executed successfully."
+        }
+    }
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+# --- Streamlit Bridge Application ---
 
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
+def process_client_request(request_str: str):
+    """
+    Parses the client request, calls the appropriate backend function,
+    and yields the responses in the specified protocol format.
+    """
+    try:
+        request = json.loads(request_str)
+        header = request.get("header", {})
+        request_id = header.get("request_id", str(uuid.uuid4()))
+        request_type = request.get("type")
+        payload = request.get("payload", {})
 
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        st.success(f"Bridge received request: {request_id} (Type: {request_type})")
 
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
-        )
+        response_header = {
+            "request_id": request_id,
+            "source_node": "streamlit-bridge-v1",
+            "timestamp_utc": datetime.utcnow().isoformat()
+        }
 
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+        # Route to the correct backend function based on request type
+        if request_type == "ONE_TIME_QUERY":
+            result_payload = backend_one_time_query(payload)
+            response = {
+                "header": response_header,
+                "status": "COMPLETED",
+                "payload": result_payload
+            }
+            yield json.dumps(response)
+
+        elif request_type == "STREAM_SUBSCRIBE":
+            for chunk in backend_stream_subscribe(payload):
+                response = {
+                    "header": response_header,
+                    "status": "STREAMING_CHUNK",
+                    "payload": chunk
+                }
+                yield json.dumps(response)
+            # Signal end of stream
+            yield json.dumps({
+                "header": response_header,
+                "status": "COMPLETED",
+                "payload": {"message": "Stream finished."}
+            })
+
+        elif request_type == "EXECUTE_COMMAND":
+            for progress_chunk in backend_execute_command(payload):
+                response = {
+                    "header": response_header,
+                    "status": "STREAMING_CHUNK",
+                    "payload": progress_chunk
+                }
+                yield json.dumps(response)
+            # Signal end of command
+            yield json.dumps({
+                "header": response_header,
+                "status": "COMPLETED",
+                "payload": {"message": "Command finished."}
+            })
+
+        else:
+            raise ValueError(f"Unknown request type: {request_type}")
+
+    except Exception as e:
+        st.error(f"Error processing request: {e}")
+        # Yield a formatted error message back to the client
+        error_response_header = {
+            "request_id": locals().get("request_id", "unknown"),
+            "source_node": "streamlit-bridge-v1",
+            "timestamp_utc": datetime.utcnow().isoformat()
+        }
+        yield json.dumps({
+            "header": error_response_header,
+            "status": "ERROR",
+            "payload": {
+                "error": {
+                    "code": "BRIDGE_PROCESSING_ERROR",
+                    "message": str(e)
+                }
+            }
+        })
+
+
+# --- Main App UI ---
+
+st.set_page_config(page_title="Streamlit Data Hub", page_icon="🌉")
+
+st.title("🌉 Streamlit Data Hub")
+st.caption("This application acts as a secure bridge between clients and backend services.")
+
+# Initialize chat history
+if "messages" not in st.session_state:
+    st.session_state.messages = [{
+        "role": "assistant", 
+        "content": "Hub is active. Waiting for client connections..."
+    }]
+
+# Display chat messages from history on app rerun
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.code(message["content"], language="json")
+
+# Accept client input
+if prompt := st.chat_input("Listening for client messages..."):
+    # Add user message to chat history
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    # Display user message in chat message container
+    with st.chat_message("user"):
+        st.code(prompt, language="json")
+
+    # Display assistant response in chat message container
+    with st.chat_message("assistant"):
+        # Use a generator to stream the response
+        response_stream = process_client_request(prompt)
+        # write_stream handles iterating through the generator and printing each chunk
+        full_response = st.write_stream(response_stream)
+
+    # Add the full response to session state (optional)
+    st.session_state.messages.append({"role": "assistant", "content": full_response}) 
